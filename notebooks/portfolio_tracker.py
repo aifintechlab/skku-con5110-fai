@@ -1,11 +1,17 @@
 """
-Portfolio tracker that ingests weekly weight files, validates allocations,
-computes NAV paths, and stores the result as a CSV.
+Portfolio tracker for weekly team submissions.
 
-The script is derived from the logic in ``notebooks/baseline.ipynb`` but
-adapted to handle weekly rebalanced portfolios whose weights live under
-``data/weights/weight_week*``. It expects a wide price table (dates x tickers)
-that contains at least the tickers referenced by the weight files.
+Loads JSON weight files from ``data/weights/weight_week*``, validates that
+allocations sum to 1, walks daily price data to build each team's NAV path,
+and then
+  * saves the end-of-week NAV snapshot to ``data/portfolio_nav.csv``,
+  * saves a performance summary table to ``data/portfolio_performance.csv``,
+  * writes a line chart of NAV paths to ``data/portfolio_nav.png``.
+
+The weekly schedule follows the specification shared alongside the notebook:
+weights submitted on Sunday are deployed starting the following Monday and
+held through that week's Sunday. Use ``--week4-start`` to override the initial
+week if future cohorts run on a different calendar.
 """
 
 from __future__ import annotations
@@ -16,17 +22,21 @@ import math
 import re
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, MutableMapping, Tuple
+from typing import Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import pandas as pd
 
 # --- Defaults & constants ---
 STARTING_CAPITAL = 10_000.0  # USD
-WEIGHT_DIR_GLOB = "weight_week*"
 WEIGHTS_ROOT = Path("data/weights")
-OUTPUT_CSV = Path("data/portfolio_nav.csv")
-# Acceptable numeric drift due to JSON rounding
+WEEKLY_NAV_CSV = Path("data/portfolio_nav.csv")
+PERF_TABLE_CSV = Path("data/portfolio_performance.csv")
+NAV_FIG_PATH = Path("data/portfolio_nav.png")
 WEIGHT_TOLERANCE = 1e-6
+TRADING_DAYS_PER_YEAR = 252
+WEEK_LENGTH_DAYS = 7
+
 # Candidates for price CSV discovery (first existing one is used if --prices not passed)
 PRICE_CSV_CANDIDATES = (
     Path("data/prices.csv"),
@@ -48,20 +58,38 @@ def parse_args() -> argparse.Namespace:
         "--prices",
         type=Path,
         default=None,
-        help="CSV with price history (dates as first column, tickers as remaining columns). "
+        help="CSV with daily price history (dates as first column, tickers as remaining columns). "
         "If omitted, a best-effort search over common locations is performed.",
     )
     parser.add_argument(
-        "--output",
+        "--nav-csv",
         type=Path,
-        default=OUTPUT_CSV,
-        help="Destination CSV for the weekly NAV table.",
+        default=WEEKLY_NAV_CSV,
+        help="Destination CSV for the weekly NAV snapshot (week/team/NAV).",
+    )
+    parser.add_argument(
+        "--performance",
+        type=Path,
+        default=PERF_TABLE_CSV,
+        help="Destination CSV for the performance summary table.",
+    )
+    parser.add_argument(
+        "--figure",
+        type=Path,
+        default=NAV_FIG_PATH,
+        help="Path to save the NAV line chart.",
     )
     parser.add_argument(
         "--capital",
         type=float,
         default=STARTING_CAPITAL,
         help="Initial capital per team in USD.",
+    )
+    parser.add_argument(
+        "--week4-start",
+        type=str,
+        default="2025-09-29",
+        help="Calendar date (YYYY-MM-DD) when week 4 trading starts.",
     )
     return parser.parse_args()
 
@@ -158,6 +186,25 @@ def collect_universe(weeks: Mapping[int, Mapping[str, Mapping[str, float]]]) -> 
     return sorted(tickers)
 
 
+def derive_week_schedule(week_numbers: Sequence[int], week4_start: str) -> Dict[int, Tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Build a mapping of week -> (start_date, end_date) using the supplied week 4 start.
+    Later weeks advance in seven day increments.
+    """
+    base_start = pd.Timestamp(week4_start).normalize()
+    schedule: Dict[int, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for week_num in sorted(week_numbers):
+        if week_num < 4:
+            raise ValueError(
+                f"Week {week_num} precedes the configured base week (4). Update --week4-start logic."
+            )
+        offset_days = (week_num - 4) * WEEK_LENGTH_DAYS
+        start_date = base_start + pd.Timedelta(days=offset_days)
+        end_date = start_date + pd.Timedelta(days=WEEK_LENGTH_DAYS - 1)
+        schedule[week_num] = (start_date, end_date)
+    return schedule
+
+
 def load_price_history(price_csv: Path, tickers: Iterable[str]) -> pd.DataFrame:
     df = pd.read_csv(price_csv, index_col=0, parse_dates=[0])
     if df.empty:
@@ -179,51 +226,127 @@ def load_price_history(price_csv: Path, tickers: Iterable[str]) -> pd.DataFrame:
     return subset
 
 
-def compute_weekly_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    weekly_prices = prices.resample("W-FRI").last()
-    weekly_prices = weekly_prices.ffill().dropna(how="any")
-    weekly_returns = weekly_prices.pct_change().dropna(how="all")
-    if weekly_returns.empty:
-        raise ValueError("Weekly returns are empty; check the price history coverage.")
-    return weekly_returns
-
-
-def compute_nav_table(
+def compute_daily_nav(
+    prices: pd.DataFrame,
     weeks: Mapping[int, Mapping[str, Mapping[str, float]]],
-    weekly_returns: pd.DataFrame,
+    schedule: Mapping[int, Tuple[pd.Timestamp, pd.Timestamp]],
     starting_capital: float,
 ) -> pd.DataFrame:
-    week_numbers = list(weeks.keys())
-    num_weeks = len(week_numbers)
-    if num_weeks == 0:
-        raise ValueError("No week weights provided.")
+    teams = sorted({team for week_allocs in weeks.values() for team in week_allocs})
+    nav_df = pd.DataFrame(index=prices.index, columns=teams, dtype=float)
+    nav_state: Dict[str, float] = {team: starting_capital for team in teams}
 
-    if len(weekly_returns) < num_weeks:
-        raise ValueError(
-            f"Weekly returns ({len(weekly_returns)}) shorter than week weights ({num_weeks})."
+    returns = prices.pct_change().fillna(0.0)
+
+    for week_num in sorted(schedule):
+        if week_num not in weeks:
+            raise ValueError(f"No weights found for week {week_num}.")
+
+        start, end = schedule[week_num]
+        start_idx = prices.index.searchsorted(start)
+        end_idx = prices.index.searchsorted(end, side="right")
+        week_dates = prices.index[start_idx:end_idx]
+        if len(week_dates) == 0:
+            raise ValueError(
+                f"No price data between {start.date()} and {end.date()} for week {week_num}."
+            )
+
+        team_weights = weeks[week_num]
+        weight_vectors = {
+            team: pd.Series(weights, dtype=float).reindex(prices.columns, fill_value=0.0)
+            for team, weights in team_weights.items()
+        }
+
+        for pos, current_date in enumerate(week_dates):
+            ret_row = returns.loc[current_date]
+            for team in teams:
+                weights = weight_vectors.get(team)
+                if pos == 0:
+                    # Record the NAV at the rebalance date before applying returns.
+                    nav_df.loc[current_date, team] = nav_state[team]
+                    continue
+                if weights is None:
+                    # If a team skipped submitting weights this week, carry capital forward unchanged.
+                    nav_df.loc[current_date, team] = nav_state[team]
+                    continue
+                portfolio_return = float(
+                    ret_row.reindex(weights.index, fill_value=0.0).mul(weights).sum()
+                )
+                nav_state[team] = nav_state[team] * (1.0 + portfolio_return)
+                nav_df.loc[current_date, team] = nav_state[team]
+
+    first_start = min(start for start, _ in schedule.values())
+    nav_df = nav_df.loc[nav_df.index >= first_start].sort_index()
+    nav_df = nav_df.ffill()
+    return nav_df
+
+
+def compute_performance_table(nav_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for team in nav_df.columns:
+        nav = nav_df[team].dropna()
+        if nav.shape[0] < 2:
+            continue
+        rets = nav.pct_change().dropna()
+        total_return = nav.iloc[-1] / nav.iloc[0] - 1.0
+        if len(rets) == 0:
+            ann_return = math.nan
+            ann_vol = math.nan
+        else:
+            ann_return = (1.0 + total_return) ** (TRADING_DAYS_PER_YEAR / len(rets)) - 1.0
+            ann_vol = rets.std(ddof=1) * math.sqrt(TRADING_DAYS_PER_YEAR) if len(rets) > 1 else math.nan
+        if ann_vol is None or math.isnan(ann_vol) or ann_vol == 0:
+            sharpe = math.nan
+        else:
+            sharpe = ann_return / ann_vol
+        cumulative_max = nav.cummax()
+        drawdown = nav / cumulative_max - 1.0
+        mdd = drawdown.min()
+        rows.append(
+            {
+                "team": team,
+                "Days": int(nav.shape[0]),
+                "TotalReturn": total_return,
+                "AnnReturn": ann_return,
+                "AnnVol": ann_vol,
+                "Sharpe": sharpe,
+                "MDD": mdd,
+                "FinalNAV": nav.iloc[-1],
+            }
         )
+    perf = pd.DataFrame(rows).set_index("team").sort_values("FinalNAV", ascending=False)
+    return perf
 
-    aligned_returns = weekly_returns.iloc[-num_weeks:].copy()
-    aligned_returns.index = week_numbers
 
-    nav_state: Dict[str, float] = {}
+def summarize_weekly_nav(nav_df: pd.DataFrame, schedule: Mapping[int, Tuple[pd.Timestamp, pd.Timestamp]]) -> pd.DataFrame:
     records = []
-    for week_num, returns_row in aligned_returns.iterrows():
-        team_allocations = weeks[week_num]
-        for team, weights in team_allocations.items():
-            nav_before = nav_state.get(team, starting_capital)
-            portfolio_return = 0.0
-            for ticker, weight in weights.items():
-                ret = returns_row.get(ticker)
-                if pd.isna(ret):
-                    raise ValueError(
-                        f"Missing return for ticker {ticker} in week {week_num} for team {team}."
-                    )
-                portfolio_return += weight * ret
-            nav_after = nav_before * (1.0 + portfolio_return)
-            nav_state[team] = nav_after
-            records.append({"week": week_num, "team": str(team), "NAV": float(nav_after)})
+    for week_num, (_, end_date) in sorted(schedule.items()):
+        mask = (nav_df.index >= schedule[week_num][0]) & (nav_df.index <= end_date)
+        nav_slice = nav_df.loc[mask]
+        if nav_slice.empty:
+            raise ValueError(f"No NAV observations found for week {week_num}.")
+        last_nav = nav_slice.iloc[-1]
+        for team, nav in last_nav.items():
+            records.append({"week": week_num, "team": team, "NAV": float(nav)})
     return pd.DataFrame(records)
+
+
+def plot_nav_paths(nav_df: pd.DataFrame, output_path: Path) -> None:
+    plt.figure(figsize=(12, 6))
+    for team in nav_df.columns:
+        series = nav_df[team].dropna()
+        if series.empty:
+            continue
+        plt.plot(series.index, series.values, linewidth=1.8, label=team)
+    plt.title("Team Portfolio NAV Paths (Weekly Rebalanced)")
+    plt.xlabel("Date")
+    plt.ylabel("Portfolio Value (USD)")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=160)
+    plt.close()
 
 
 def save_nav_table(nav_table: pd.DataFrame, destination: Path) -> None:
@@ -236,14 +359,22 @@ def main() -> None:
     weeks = load_weights(args.weights)
     tickers = collect_universe(weeks)
 
+    schedule = derive_week_schedule(weeks.keys(), args.week4_start)
     price_csv = discover_price_csv(args.prices)
     prices = load_price_history(price_csv, tickers)
-    weekly_returns = compute_weekly_returns(prices)
 
-    nav_table = compute_nav_table(weeks, weekly_returns, args.capital)
-    save_nav_table(nav_table, args.output)
+    nav_df = compute_daily_nav(prices, weeks, schedule, args.capital)
+    plot_nav_paths(nav_df, args.figure)
 
-    print(f"Wrote NAV table to {args.output} ({len(nav_table)} rows)")
+    perf_table = compute_performance_table(nav_df)
+    perf_table.to_csv(args.performance, float_format="%.6f")
+
+    weekly_nav = summarize_weekly_nav(nav_df, schedule)
+    save_nav_table(weekly_nav, args.nav_csv)
+
+    print(f"Wrote weekly NAV snapshot to {args.nav_csv} ({len(weekly_nav)} rows).")
+    print(f"Wrote performance table to {args.performance} ({len(perf_table)} teams).")
+    print(f"Wrote NAV chart to {args.figure}.")
 
 
 if __name__ == "__main__":
