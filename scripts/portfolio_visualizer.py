@@ -546,12 +546,22 @@ def main() -> None:
     performance_rows = compute_performance(nav_series)
     weekly_rows = summarize_weekly(nav_series, schedule)
 
-    write_csv(args.nav_csv, weekly_rows, ["week", "team", "NAV"])
-    write_csv(
-        args.performance,
-        performance_rows,
-        ["team", "Days", "TotalReturn", "AnnReturn", "AnnVol", "Sharpe", "MDD", "FinalNAV"],
-    )
+    weekly_rows_rounded = [
+        {"week": row["week"], "team": row["team"], "NAV": round(row["NAV"], 3)}
+        for row in weekly_rows
+    ]
+    write_csv(args.nav_csv, weekly_rows_rounded, ["week", "team", "NAV"])
+
+    perf_headers = ["team", "Days", "TotalReturn", "AnnReturn", "AnnVol", "Sharpe", "MDD", "FinalNAV"]
+    performance_rows_rounded = []
+    for row in performance_rows:
+        rounded = row.copy()
+        for key in ["TotalReturn", "AnnReturn", "AnnVol", "Sharpe", "MDD", "FinalNAV"]:
+            if key in rounded and rounded[key] is not None:
+                rounded[key] = round(rounded[key], 3)
+        performance_rows_rounded.append(rounded)
+
+    write_csv(args.performance, performance_rows_rounded, perf_headers)
     write_timeseries_csv(args.timeseries, nav_series)
     render_svg(nav_series, args.figure)
 
