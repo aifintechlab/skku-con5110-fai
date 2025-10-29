@@ -45,6 +45,7 @@ IGNORE_META = {
 CONTAINER_KEYS = {"portfolio", "weights", "allocations", "allocation", "holdings"}
 TRADING_DAYS_PER_YEAR = 252
 WEEK_LENGTH_DAYS = 7
+RF_RATE = 0.0435
 
 
 @dataclass
@@ -365,7 +366,7 @@ def compute_performance(nav_series: Mapping[str, List[Tuple[date, float]]]) -> L
 
         total_return = nav_values[-1] / nav_values[0] - 1.0
         days = len(nav_values)
-        sharpe = ann_return / ann_vol if ann_vol > 0 else float("nan")
+        sharpe = ((ann_return - RF_RATE) / ann_vol) if ann_vol > 0 else float("nan")
 
         peak = nav_values[0]
         mdd = 0.0
