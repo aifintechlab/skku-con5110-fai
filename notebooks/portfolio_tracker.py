@@ -24,8 +24,12 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple
 
-import matplotlib.pyplot as plt
 import pandas as pd
+
+try:
+    import matplotlib.pyplot as plt  # type: ignore
+except ImportError:  # pragma: no cover - plotting is optional if matplotlib missing
+    plt = None
 
 # --- Defaults & constants ---
 STARTING_CAPITAL = 10_000.0  # USD
@@ -36,6 +40,8 @@ NAV_FIG_PATH = Path("data/portfolio_nav.png")
 WEIGHT_TOLERANCE = 1e-6
 TRADING_DAYS_PER_YEAR = 252
 WEEK_LENGTH_DAYS = 7
+CASH_LABEL = "CASH"
+CASH_KEYWORDS = {"cash", "money"}
 
 # Candidates for price CSV discovery (first existing one is used if --prices not passed)
 PRICE_CSV_CANDIDATES = (
@@ -151,8 +157,7 @@ def load_weights(weights_root: Path) -> Dict[int, Dict[str, Dict[str, float]]]:
 
         team_weights: Dict[str, Dict[str, float]] = {}
         for weight_path in team_files:
-            raw = json.loads(weight_path.read_text())
-            weights = {ticker: float(weight) for ticker, weight in raw.items()}
+            weights = _load_weight_dict(weight_path)
             _validate_weights(weights, weight_path)
             team_weights[weight_path.stem] = weights
         weeks[week_num] = team_weights
@@ -178,12 +183,119 @@ def _validate_weights(weights: Mapping[str, float], location: Path) -> None:
         raise ValueError(f"Negative weights detected in {location}: {negatives}")
 
 
+def _load_weight_dict(path: Path) -> Dict[str, float]:
+    """
+    Load a weight JSON file while tolerating assignment wrappers such as
+    ``portfolio = {...}``, then collapse any metadata layers (e.g. portfolio,
+    notes, week_of) so the result is a flat ticker->weight mapping.
+    """
+    text = path.read_text().strip()
+    if not text:
+        raise ValueError(f"Empty weight file: {path}")
+
+    parse_candidates = [text]
+
+    if "=" in text:
+        rhs = text.split("=", 1)[1].strip()
+        parse_candidates.append(rhs)
+
+    brace_start = text.find("{")
+    brace_end = text.rfind("}")
+    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+        parse_candidates.append(text[brace_start : brace_end + 1])
+
+    for candidate in parse_candidates:
+        cleaned = candidate.strip().rstrip(";.")
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            continue
+        weights = _extract_weight_mapping(data)
+        if weights:
+            return weights
+        raise ValueError(f"Weight file does not contain ticker weights: {path}")
+
+    raise ValueError(f"Unable to parse weight file as JSON: {path}")
+
+
+def _extract_weight_mapping(obj) -> Dict[str, float]:
+    ignore_meta = {
+        "week_of",
+        "week",
+        "date",
+        "notes",
+        "note",
+        "comment",
+        "comments",
+        "team",
+        "name",
+        "id",
+        "portfolio_name",
+    }
+    container_keys = {"portfolio", "weights", "allocations", "allocation", "holdings"}
+
+    def normalise_ticker(ticker: str) -> str:
+        ticker_clean = str(ticker).strip()
+        if ticker_clean == "":
+            raise ValueError("Encountered empty ticker symbol.")
+        if ticker_clean.lower() in CASH_KEYWORDS:
+            return CASH_LABEL
+        return ticker_clean
+
+    def from_dict(data: Mapping) -> Dict[str, float]:
+        acc: Dict[str, float] = {}
+        for key, value in data.items():
+            key_str = str(key).strip()
+            key_lower = key_str.lower()
+            if key_lower in ignore_meta:
+                continue
+            if key_lower in container_keys and isinstance(value, (Mapping, list)):
+                acc.update(_extract_weight_mapping(value))
+                continue
+            if isinstance(value, Mapping):
+                weight_field = _find_weight_field(value)
+                if weight_field is not None:
+                    acc[normalise_ticker(key_str)] = weight_field
+                else:
+                    acc.update(_extract_weight_mapping(value))
+                continue
+            if isinstance(value, (int, float)):
+                acc[normalise_ticker(key_str)] = float(value)
+                continue
+            if isinstance(value, str):
+                try:
+                    acc[normalise_ticker(key_str)] = float(value)
+                except ValueError:
+                    # non-numeric string such as reasons/notes -> skip
+                    pass
+        return acc
+
+    if isinstance(obj, Mapping):
+        return from_dict(obj)
+    if isinstance(obj, list):
+        merged: Dict[str, float] = {}
+        for item in obj:
+            merged.update(_extract_weight_mapping(item))
+        return merged
+    raise ValueError("Unexpected weight payload structure.")
+
+
+def _find_weight_field(candidate: Mapping) -> float | None:
+    for key, value in candidate.items():
+        if str(key).strip().lower() == "weight":
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def collect_universe(weeks: Mapping[int, Mapping[str, Mapping[str, float]]]) -> Iterable[str]:
     tickers = set()
     for week_allocs in weeks.values():
         for weights in week_allocs.values():
             tickers.update(weights.keys())
-    return sorted(tickers)
+    return sorted(t for t in tickers if t != CASH_LABEL)
 
 
 def derive_week_schedule(week_numbers: Sequence[int], week4_start: str) -> Dict[int, Tuple[pd.Timestamp, pd.Timestamp]]:
@@ -252,10 +364,11 @@ def compute_daily_nav(
             )
 
         team_weights = weeks[week_num]
-        weight_vectors = {
-            team: pd.Series(weights, dtype=float).reindex(prices.columns, fill_value=0.0)
-            for team, weights in team_weights.items()
-        }
+        weight_vectors = {}
+        for team, weights in team_weights.items():
+            series = pd.Series(weights, dtype=float)
+            cash = series.pop(CASH_LABEL, None)
+            weight_vectors[team] = series.reindex(prices.columns, fill_value=0.0)
 
         for pos, current_date in enumerate(week_dates):
             ret_row = returns.loc[current_date]
@@ -332,6 +445,9 @@ def summarize_weekly_nav(nav_df: pd.DataFrame, schedule: Mapping[int, Tuple[pd.T
 
 
 def plot_nav_paths(nav_df: pd.DataFrame, output_path: Path) -> None:
+    if plt is None:
+        print("matplotlib not available; skipping NAV plot generation.")
+        return
     plt.figure(figsize=(12, 6))
     for team in nav_df.columns:
         series = nav_df[team].dropna()

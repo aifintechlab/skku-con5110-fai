@@ -1,0 +1,270 @@
+"""
+Download daily close prices for every ticker referenced in the weekly weight files.
+
+This replaces the earlier synthetic generator. It walks through
+``data/weights/weight_week*/*.json`` to gather the unique tickers (excluding any
+cash placeholders), queries Yahoo Finance via ``yfinance``, and produces a
+wide CSV with one column per ticker. Missing observations are forward-filled so
+downstream backtests start with a clean table.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, MutableSet, Sequence
+
+import pandas as pd
+
+try:
+    import yfinance as yf
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "yfinance is required for this script. Install with `pip install yfinance pandas`."
+    ) from exc
+
+
+CASH_LABEL = "CASH"
+CASH_KEYWORDS = {"cash", "money"}
+IGNORE_META = {
+    "week_of",
+    "week",
+    "date",
+    "notes",
+    "note",
+    "comment",
+    "comments",
+    "team",
+    "name",
+    "id",
+    "portfolio_name",
+}
+CONTAINER_KEYS = {"portfolio", "weights", "allocations", "allocation", "holdings"}
+
+# yfinance behaves better when requests are chunked; >100 tickers often times out.
+CHUNK_SIZE = 50
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Download Yahoo Finance close prices for all submitted tickers.")
+    parser.add_argument(
+        "--weights-root",
+        type=Path,
+        default=Path("data/weights"),
+        help="Root directory containing weight_week*/team.json files.",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
+        default=date(2025, 9, 29),
+        help="First trading day to download (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
+        default=date(2025, 10, 30),
+        help="Last trading day to download (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/prices.csv"),
+        help="Destination CSV for the consolidated price table.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=CHUNK_SIZE,
+        help="Number of tickers to fetch per yfinance call (smaller reduces timeout risk).",
+    )
+    parser.add_argument(
+        "--no-forward-fill",
+        action="store_true",
+        help="Disable forward-filling of missing prices.",
+    )
+    return parser.parse_args()
+
+
+def gather_tickers(weights_root: Path) -> Sequence[str]:
+    if not weights_root.exists():
+        raise FileNotFoundError(f"Weights root not found: {weights_root}")
+
+    tickers: MutableSet[str] = set()
+    for path in weights_root.glob("weight_week*/*.json"):
+        weights = load_weight_mapping(path)
+        for ticker in weights:
+            if ticker != CASH_LABEL:
+                tickers.add(ticker)
+    if not tickers:
+        raise ValueError(f"No tickers extracted from {weights_root}")
+    return sorted(tickers)
+
+
+def load_weight_mapping(path: Path) -> Dict[str, float]:
+    text = path.read_text().strip()
+    if not text:
+        raise ValueError(f"Empty weight file: {path}")
+
+    candidates = [text]
+    if "=" in text:
+        candidates.append(text.split("=", 1)[1].strip())
+
+    brace_start = text.find("{")
+    brace_end = text.rfind("}")
+    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+        candidates.append(text[brace_start : brace_end + 1])
+
+    for candidate in candidates:
+        cleaned = candidate.strip().rstrip(";.")
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            continue
+        weights = extract_weight_mapping(data)
+        if weights:
+            return weights
+    raise ValueError(f"Unable to parse weight file as JSON: {path}")
+
+
+def extract_weight_mapping(obj) -> Dict[str, float]:
+    def normalise_ticker(ticker: str) -> str:
+        t_clean = str(ticker).strip()
+        if t_clean.lower() in CASH_KEYWORDS:
+            return CASH_LABEL
+        return t_clean
+
+    def from_mapping(data: Mapping) -> Dict[str, float]:
+        acc: Dict[str, float] = {}
+        for key, value in data.items():
+            key_str = str(key).strip()
+            if key_str.lower() in IGNORE_META:
+                continue
+            if key_str.lower() in CONTAINER_KEYS and isinstance(value, (Mapping, list)):
+                acc.update(extract_weight_mapping(value))
+                continue
+            if isinstance(value, Mapping):
+                maybe_weight = find_weight_field(value)
+                if maybe_weight is not None:
+                    acc[normalise_ticker(key_str)] = maybe_weight
+                else:
+                    acc.update(extract_weight_mapping(value))
+                continue
+            if isinstance(value, (int, float)):
+                acc[normalise_ticker(key_str)] = float(value)
+                continue
+            if isinstance(value, str):
+                try:
+                    acc[normalise_ticker(key_str)] = float(value)
+                except ValueError:
+                    pass
+        return acc
+
+    if isinstance(obj, Mapping):
+        return from_mapping(obj)
+    if isinstance(obj, list):
+        merged: Dict[str, float] = {}
+        for item in obj:
+            merged.update(extract_weight_mapping(item))
+        return merged
+    return {}
+
+
+def find_weight_field(candidate: Mapping) -> float | None:
+    for key, value in candidate.items():
+        if str(key).strip().lower() == "weight":
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def chunked(seq: Sequence[str], size: int) -> Iterable[Sequence[str]]:
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def download_close_prices(
+    tickers: Sequence[str],
+    start: date,
+    end: date,
+    chunk_size: int,
+) -> pd.DataFrame:
+    if start > end:
+        raise ValueError("start_date must be on/before end_date.")
+
+    dfs: List[pd.DataFrame] = []
+    yf_end = end + timedelta(days=1)  # yfinance end date is exclusive
+
+    for batch in chunked(tickers, chunk_size):
+        raw = yf.download(
+            tickers=list(batch),
+            start=start.isoformat(),
+            end=yf_end.isoformat(),
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            actions=False,
+            progress=False,
+            threads=True,
+        )
+        close = extract_close_from_yf(raw, batch)
+        if close.empty:
+            continue
+        dfs.append(close)
+
+    if not dfs:
+        raise RuntimeError("Failed to download prices for the requested tickers.")
+
+    combined = pd.concat(dfs, axis=1)
+    combined = combined.loc[~combined.index.duplicated()].sort_index()
+    # Limit to requested window again (defensive)
+    combined = combined[(combined.index.date >= start) & (combined.index.date <= end)]
+    combined.index.name = "Date"
+    return combined
+
+
+def extract_close_from_yf(df: pd.DataFrame, tickers: Sequence[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df, pd.Series):
+        return df.to_frame(name="Close")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Close" in df.columns.get_level_values(0):
+            return df["Close"]
+        frames = []
+        for ticker in tickers:
+            if ticker in df.columns.get_level_values(0):
+                sub = df[ticker]
+                if "Close" in sub.columns:
+                    frames.append(sub["Close"].rename(ticker))
+        if frames:
+            return pd.concat(frames, axis=1)
+    return df
+
+
+def main() -> None:
+    args = parse_args()
+    tickers = gather_tickers(args.weights_root)
+    prices = download_close_prices(tickers, args.start_date, args.end_date, args.chunk_size)
+    if not args.no_forward_fill:
+        prices = prices.ffill()
+    prices = prices.dropna(how="all")
+    if prices.empty:
+        raise RuntimeError("Price table is empty after cleaning.")
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    prices.to_csv(args.output, float_format="%.6f")
+    print(
+        f"Wrote {args.output} with {prices.shape[0]} rows and {prices.shape[1]} tickers "
+        "(Yahoo Finance close prices)."
+    )
+
+
+if __name__ == "__main__":
+    main()
