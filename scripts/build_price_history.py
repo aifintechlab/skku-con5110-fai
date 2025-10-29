@@ -223,6 +223,7 @@ def download_close_prices(
     combined = combined.loc[~combined.index.duplicated()].sort_index()
     # Limit to requested window again (defensive)
     combined = combined[(combined.index.date >= start) & (combined.index.date <= end)]
+    combined.index = combined.index.tz_localize(None)
     combined.index.name = "Date"
     return combined
 
@@ -248,10 +249,63 @@ def extract_close_from_yf(df: pd.DataFrame, tickers: Sequence[str]) -> pd.DataFr
     return df
 
 
+def convert_krw_to_usd(prices: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    kr_tickers = [col for col in prices.columns if col.endswith(".KS")]
+    if not kr_tickers:
+        return prices
+
+    fx_end = end + timedelta(days=1)
+    fx = yf.download(
+        tickers="KRW=X",
+        start=start.isoformat(),
+        end=fx_end.isoformat(),
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+    )
+    if fx.empty:
+        raise RuntimeError("Failed to download KRW=X FX rate for KRW tickers.")
+
+    if isinstance(fx.columns, pd.MultiIndex):
+        fx_close = fx["Close"]
+        if isinstance(fx_close, pd.Series):
+            fx_series = fx_close
+        else:
+            if "KRW=X" in fx_close.columns:
+                fx_series = fx_close["KRW=X"]
+            else:
+                fx_series = fx_close.squeeze()
+    else:
+        fx_series = fx["Close"].squeeze()
+
+    if not isinstance(fx_series, pd.Series):
+        fx_series = pd.Series(fx_series)
+
+    fx_series = fx_series.tz_localize(None).rename("KRW=X")
+    fx_series = fx_series.reindex(prices.index).ffill()
+    if fx_series.isna().any():
+        raise RuntimeError("KRW=X FX series has missing values after alignment.")
+
+    prices.loc[:, kr_tickers] = prices.loc[:, kr_tickers].div(fx_series, axis=0)
+    return prices
+
+
+def drop_crypto_only_rows(prices: pd.DataFrame) -> pd.DataFrame:
+    non_crypto = [col for col in prices.columns if not col.endswith("-USD")]
+    if not non_crypto:
+        return prices
+    mask = prices[non_crypto].isna().all(axis=1)
+    if mask.any():
+        prices = prices.loc[~mask]
+    return prices
+
+
 def main() -> None:
     args = parse_args()
     tickers = gather_tickers(args.weights_root)
     prices = download_close_prices(tickers, args.start_date, args.end_date, args.chunk_size)
+    prices = drop_crypto_only_rows(prices)
+    prices = convert_krw_to_usd(prices, args.start_date, args.end_date)
     if not args.no_forward_fill:
         prices = prices.ffill()
     prices = prices.dropna(how="all")
