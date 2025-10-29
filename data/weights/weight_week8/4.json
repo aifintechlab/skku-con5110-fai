@@ -1,0 +1,45 @@
+{
+  "week_of": "2025-10-26",
+  "portfolio": {
+    "SPY": {
+      "quantity": 2.727352711,
+      "weight": 0.18
+    },
+    "VGT": {
+      "quantity": 1.469574005,
+      "weight": 0.11
+    },
+    "SOXX": {
+      "quantity": 2.092239966,
+      "weight": 0.06
+    },
+    "BTC-USD": {
+      "quantity": 0.01009739884,
+      "weight": 0.11
+    },
+    "GOOGL": {
+      "quantity": 2.013484508,
+      "weight": 0.05
+    },
+    "PLTR": {
+      "quantity": 8.4608587,
+      "weight": 0.15
+    },
+    "TLT": {
+      "quantity": 5.509144654,
+      "weight": 0.05
+    },
+    "GLD": {
+      "quantity": 1.21413906,
+      "weight": 0.04
+    },
+    "EWY": {
+      "quantity": 11.14792458,
+      "weight": 0.1
+    },
+    "MONEY": {
+      "quantity": 1507.301977,
+      "weight": 0.15
+    }
+  }
+}
