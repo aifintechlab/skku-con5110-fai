@@ -32,7 +32,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Build site
-        run: python scripts/build_site.py --start-date 2025-09-30 --end-date 2025-10-29 --week4-start 2025-09-30
+        run: python scripts/build_site.py
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

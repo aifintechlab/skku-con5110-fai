@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from datetime import date
 
 import pandas as pd
 
@@ -177,14 +178,17 @@ def build_site(
 
 def parse_args() -> argparse.Namespace:
     today = dt.date.today()
-    default_start = dt.date(2025, 9, 29).isoformat()
-    default_end = dt.date(2025, 11, 2).isoformat()
+    start_baseline = dt.date(2025, 9, 30)
+    default_start_str = start_baseline.isoformat()
+    # latest business day (if weekend, roll back to Friday)
+    default_end = (pd.Timestamp(today) - pd.tseries.offsets.BDay(0)).date()
+    default_end_str = default_end.isoformat()
     parser = argparse.ArgumentParser(description="Generate static site with latest NAV analytics.")
-    parser.add_argument("--start-date", default=default_start, help="Start date for price download (YYYY-MM-DD).")
-    parser.add_argument("--end-date", default=default_end, help="End date for price download (YYYY-MM-DD).")
+    parser.add_argument("--start-date", default=default_start_str, help="Start date for price download (YYYY-MM-DD).")
+    parser.add_argument("--end-date", default=default_end_str, help="End date for price download (YYYY-MM-DD).")
     parser.add_argument(
         "--week4-start",
-        default="2025-09-30",
+        default=start_baseline.isoformat(),
         help="Calendar date corresponding to week 4 trading start (YYYY-MM-DD).",
     )
     parser.add_argument("--capital", type=float, default=10_000.0, help="Initial capital per team.")
