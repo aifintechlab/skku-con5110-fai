@@ -354,10 +354,6 @@ def compute_performance(nav_series: Mapping[str, List[Tuple[date, float]]]) -> L
         if not returns:
             continue
 
-        total_return = nav_values[-1] / nav_values[0] - 1.0
-        days = len(nav_values)
-        ann_return = (1.0 + total_return) ** (TRADING_DAYS_PER_YEAR / len(returns)) - 1.0
-
         mean_return = sum(returns) / len(returns)
         variance = (
             sum((r - mean_return) ** 2 for r in returns) / (len(returns) - 1)
@@ -365,6 +361,10 @@ def compute_performance(nav_series: Mapping[str, List[Tuple[date, float]]]) -> L
             else 0.0
         )
         ann_vol = math.sqrt(variance) * math.sqrt(TRADING_DAYS_PER_YEAR)
+        ann_return = mean_return * TRADING_DAYS_PER_YEAR
+
+        total_return = nav_values[-1] / nav_values[0] - 1.0
+        days = len(nav_values)
         sharpe = ann_return / ann_vol if ann_vol > 0 else float("nan")
 
         peak = nav_values[0]
