@@ -15,6 +15,7 @@ import json
 import math
 from datetime import date, datetime, timedelta
 from pathlib import Path
+import time
 from typing import Dict, Iterable, List, Mapping, MutableSet, Sequence
 
 import pandas as pd
@@ -46,6 +47,8 @@ CONTAINER_KEYS = {"portfolio", "weights", "allocations", "allocation", "holdings
 
 # yfinance behaves better when requests are chunked; >100 tickers often times out.
 CHUNK_SIZE = 50
+MAX_RETRIES = 3
+RETRY_DELAY = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,21 +203,9 @@ def download_close_prices(
     yf_end = end + timedelta(days=1)  # yfinance end date is exclusive
 
     for batch in chunked(tickers, chunk_size):
-        raw = yf.download(
-            tickers=list(batch),
-            start=start.isoformat(),
-            end=yf_end.isoformat(),
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=False,
-            actions=False,
-            progress=False,
-            threads=True,
-        )
-        close = extract_close_from_yf(raw, batch)
-        if close.empty:
-            continue
-        dfs.append(close)
+        close = _download_batch(batch, start, yf_end)
+        if not close.empty:
+            dfs.append(close)
 
     if not dfs:
         raise RuntimeError("Failed to download prices for the requested tickers.")
@@ -225,6 +216,7 @@ def download_close_prices(
     combined = combined[(combined.index.date >= start) & (combined.index.date <= end)]
     combined.index = combined.index.tz_localize(None)
     combined.index.name = "Date"
+    combined = _recover_missing_tickers(combined, tickers, start, end)
     return combined
 
 
@@ -247,6 +239,71 @@ def extract_close_from_yf(df: pd.DataFrame, tickers: Sequence[str]) -> pd.DataFr
         if frames:
             return pd.concat(frames, axis=1)
     return df
+
+
+def _download_batch(batch: Sequence[str], start: date, yf_end: date) -> pd.DataFrame:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            raw = yf.download(
+                tickers=list(batch),
+                start=start.isoformat(),
+                end=yf_end.isoformat(),
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                actions=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception as exc:
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(RETRY_DELAY * attempt)
+            continue
+        close = extract_close_from_yf(raw, batch)
+        if close.empty:
+            time.sleep(RETRY_DELAY * attempt)
+            continue
+        return close
+    return pd.DataFrame()
+
+
+def _recover_missing_tickers(prices: pd.DataFrame, tickers: Sequence[str], start: date, end: date) -> pd.DataFrame:
+    yf_end = end + timedelta(days=1)
+    missing = []
+    for ticker in tickers:
+        if ticker not in prices.columns:
+            missing.append(ticker)
+            continue
+        series = prices[ticker]
+        if series.isna().all():
+            missing.append(ticker)
+    if not missing:
+        return prices
+
+    recovered = []
+    for ticker in missing:
+        data = _download_batch([ticker], start, yf_end)
+        if data.empty or ticker not in data.columns or data[ticker].isna().all():
+            print(f"[WARN] Failed to recover ticker {ticker} after retries.")
+            continue
+        recovered.append(data[[ticker]])
+
+    if recovered:
+        prices = pd.concat([prices] + recovered, axis=1)
+        prices = prices.loc[:, sorted(prices.columns)]
+
+    still_missing = [
+        ticker
+        for ticker in tickers
+        if ticker not in prices.columns or prices[ticker].isna().all()
+    ]
+    if still_missing:
+        raise RuntimeError(
+            f"Unable to download prices for tickers: {', '.join(still_missing)}. "
+            "Please re-run later."
+        )
+    return prices
 
 
 def convert_krw_to_usd(prices: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
@@ -311,6 +368,11 @@ def main() -> None:
     prices = prices.dropna(how="all")
     if prices.empty:
         raise RuntimeError("Price table is empty after cleaning.")
+    cols_with_na = prices.columns[prices.isna().any()].tolist()
+    if cols_with_na:
+        raise RuntimeError(
+            f"Price table still contains missing values for tickers: {', '.join(cols_with_na)}"
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     prices.to_csv(args.output, float_format="%.6f")

@@ -282,7 +282,12 @@ def load_price_table(price_csv: Path, required_tickers: Iterable[str]) -> PriceT
             dt = datetime.strptime(row[0], "%Y-%m-%d").date()
             date_list.append(dt)
             for ticker, cell in zip(tickers, row[1:]):
-                prices[ticker].append(float(cell))
+                value = cell.strip()
+                if value == "":
+                    raise ValueError(
+                        f"Missing price for ticker {ticker} on {dt} in {price_csv}."
+                    )
+                prices[ticker].append(float(value))
 
     return PriceTable(dates=date_list, tickers=tickers, prices=prices)
 
