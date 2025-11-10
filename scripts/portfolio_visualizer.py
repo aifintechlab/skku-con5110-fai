@@ -418,6 +418,17 @@ def summarize_weekly(nav_series: Mapping[str, List[Tuple[date, float]]], schedul
     return week_records
 
 
+def clamp_schedule_to_prices(
+    schedule: Mapping[int, Tuple[date, date]], last_price_date: date
+) -> Dict[int, Tuple[date, date]]:
+    clamped: Dict[int, Tuple[date, date]] = {}
+    for week, (start, end) in schedule.items():
+        if start > last_price_date:
+            continue
+        clamped[week] = (start, min(end, last_price_date))
+    return clamped
+
+
 def write_csv(path: Path, rows: List[Dict[str, object]], headers: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
@@ -547,6 +558,10 @@ def main() -> None:
     schedule = derive_week_schedule(weeks.keys(), args.week4_start)
     tickers = {ticker for week in weeks.values() for weights in week.values() for ticker in weights if ticker != CASH_LABEL}
     price_table = load_price_table(args.prices, tickers)
+    last_price_date = price_table.dates[-1]
+    schedule = clamp_schedule_to_prices(schedule, last_price_date)
+    if not schedule:
+        raise ValueError("Price history does not cover the earliest scheduled week.")
 
     nav_series = compute_nav_paths(price_table, weeks, schedule, args.capital)
     performance_rows = compute_performance(nav_series)

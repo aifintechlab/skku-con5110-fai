@@ -368,6 +368,11 @@ def main() -> None:
     prices = prices.dropna(how="all")
     if prices.empty:
         raise RuntimeError("Price table is empty after cleaning.")
+    missing_tickers = [ticker for ticker in tickers if ticker not in prices.columns]
+    if missing_tickers:
+        raise RuntimeError(
+            "Price table is missing the following tickers: " + ", ".join(missing_tickers)
+        )
     cols_with_na = prices.columns[prices.isna().any()].tolist()
     if cols_with_na:
         raise RuntimeError(
