@@ -1,0 +1,35 @@
+{
+  "week_of": "2025-11-02",
+  "portfolio": {
+    "SPY": {
+      "weight": 0.18
+    },
+    "VGT": {
+      "weight": 0.11
+    },
+    "SOXX": {
+      "weight": 0.06
+    },
+    "BTC-USD": {
+      "weight": 0.11
+    },
+    "GOOGL": {
+      "weight": 0.05
+    },
+    "PLTR": {
+      "weight": 0.14
+    },
+    "TLT": {
+      "weight": 0.05
+    },
+    "GLD": {
+      "weight": 0.04
+    },
+    "EWY": {
+      "weight": 0.12
+    },
+    "MONEY": {
+      "weight": 0.14
+    }
+  }
+}
