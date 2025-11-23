@@ -15,7 +15,7 @@ This project builds a static portfolio dashboard from weekly weight submissions.
 - `scripts/portfolio_visualizer.py`
   - Loads `data/prices.csv`, weights, and builds NAV paths with weekly rebalancing.
   - Clamps weekly schedule to available price data; missing prices raise errors.
-  - Saves weekly NAV (`data/portfolio_nav.csv`), daily NAV timeseries, performance table (TotalReturn, simple annualized return/vol, Sharpe with RF 4.35%, MDD, FinalNAV), and `data/portfolio_nav.svg`.
+  - Saves weekly NAV (`data/portfolio_nav.csv`), daily NAV timeseries, performance table (TotalReturn, simple annualized return/vol, Sharpe with RF 4.35%, MDD, skewness, 95% VaR/ES, average turnover, FinalNAV), and `data/portfolio_nav.svg`.
   - Key params: `--week4-start`, `--capital`, `--prices`.
 
 - `scripts/build_site.py`

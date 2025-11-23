@@ -109,7 +109,7 @@ def build_index_html(target_dir: Path, svg_path: Path, perf_csv: Path, weekly_cs
     </section>
     <section>
       <h2>Performance Summary</h2>
-      <p class="meta">Total return, annualised return/volatility, Sharpe (RF = 4.35%), and drawdown per team.</p>
+      <p class="meta">Return stats, risk (Sharpe, drawdown, skew, VaR/ES @95%), and average weekly turnover per team.</p>
       {perf_table}
       <div class="actions">
         <a href="{perf_csv.name}">Download performance table (CSV)</a>

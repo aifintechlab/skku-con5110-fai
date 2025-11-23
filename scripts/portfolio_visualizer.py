@@ -46,6 +46,7 @@ CONTAINER_KEYS = {"portfolio", "weights", "allocations", "allocation", "holdings
 TRADING_DAYS_PER_YEAR = 252
 WEEK_LENGTH_DAYS = 7
 RF_RATE = 0.0435
+VAR_CONFIDENCE = 0.95
 
 
 @dataclass
@@ -345,7 +346,63 @@ def compute_nav_paths(
     return nav_series
 
 
-def compute_performance(nav_series: Mapping[str, List[Tuple[date, float]]]) -> List[Dict[str, float]]:
+def _quantile(values: List[float], quantile: float) -> float:
+    if not values:
+        return float("nan")
+    if quantile <= 0:
+        return min(values)
+    if quantile >= 1:
+        return max(values)
+    sorted_vals = sorted(values)
+    idx = (len(sorted_vals) - 1) * quantile
+    lower = math.floor(idx)
+    upper = math.ceil(idx)
+    if lower == upper:
+        return sorted_vals[int(idx)]
+    weight = idx - lower
+    return sorted_vals[lower] * (1 - weight) + sorted_vals[upper] * weight
+
+
+def _skewness(returns: List[float]) -> float:
+    n = len(returns)
+    if n < 3:
+        return float("nan")
+    mean = sum(returns) / n
+    m2 = sum((r - mean) ** 2 for r in returns) / n
+    if m2 == 0:
+        return 0.0
+    m3 = sum((r - mean) ** 3 for r in returns) / n
+    return math.sqrt(n * (n - 1)) / (n - 2) * (m3 / (m2 ** 1.5))
+
+
+def compute_turnover(weeks: Mapping[int, Mapping[str, Mapping[str, float]]]) -> Dict[str, float]:
+    teams = sorted({team for week_allocs in weeks.values() for team in week_allocs})
+    previous: Dict[str, Dict[str, float] | None] = {team: None for team in teams}
+    totals: Dict[str, float] = {team: 0.0 for team in teams}
+    counts: Dict[str, int] = {team: 0 for team in teams}
+
+    for week in sorted(weeks):
+        week_allocs = weeks[week]
+        for team in teams:
+            weights = dict(week_allocs.get(team, {}))
+            weights.pop(CASH_LABEL, None)
+            prior = previous[team]
+            if prior is None:
+                previous[team] = weights
+                continue
+            tickers = set(prior) | set(weights)
+            turnover = 0.5 * sum(abs(weights.get(t, 0.0) - prior.get(t, 0.0)) for t in tickers)
+            totals[team] += turnover
+            counts[team] += 1
+            previous[team] = weights
+
+    return {team: (totals[team] / counts[team] if counts[team] else 0.0) for team in teams}
+
+
+def compute_performance(
+    nav_series: Mapping[str, List[Tuple[date, float]]],
+    turnover_map: Mapping[str, float] | None = None,
+) -> List[Dict[str, float]]:
     records: List[Dict[str, float]] = []
     for team, series in nav_series.items():
         if len(series) < 2:
@@ -372,6 +429,12 @@ def compute_performance(nav_series: Mapping[str, List[Tuple[date, float]]]) -> L
         total_return = nav_values[-1] / nav_values[0] - 1.0
         days = len(nav_values)
         sharpe = ((ann_return - RF_RATE) / ann_vol) if ann_vol > 0 else float("nan")
+        skew = _skewness(returns)
+        tail_q = 1.0 - VAR_CONFIDENCE
+        var_threshold = _quantile(returns, tail_q)
+        tail_returns = [r for r in returns if r <= var_threshold]
+        es = sum(tail_returns) / len(tail_returns) if tail_returns else var_threshold
+        turnover = turnover_map.get(team) if turnover_map else float("nan")
 
         peak = nav_values[0]
         mdd = 0.0
@@ -392,6 +455,10 @@ def compute_performance(nav_series: Mapping[str, List[Tuple[date, float]]]) -> L
                 "Sharpe": sharpe,
                 "MDD": mdd,
                 "FinalNAV": nav_values[-1],
+                "Skew": skew,
+                "VaR": var_threshold,
+                "ES": es,
+                "Turnover": turnover,
             }
         )
     records.sort(key=lambda row: row["FinalNAV"], reverse=True)
@@ -564,7 +631,8 @@ def main() -> None:
         raise ValueError("Price history does not cover the earliest scheduled week.")
 
     nav_series = compute_nav_paths(price_table, weeks, schedule, args.capital)
-    performance_rows = compute_performance(nav_series)
+    turnover_map = compute_turnover(weeks)
+    performance_rows = compute_performance(nav_series, turnover_map)
     weekly_rows = summarize_weekly(nav_series, schedule)
 
     weekly_rows_rounded = [
@@ -573,11 +641,24 @@ def main() -> None:
     ]
     write_csv(args.nav_csv, weekly_rows_rounded, ["week", "team", "NAV"])
 
-    perf_headers = ["team", "Days", "TotalReturn", "AnnReturn", "AnnVol", "Sharpe", "MDD", "FinalNAV"]
+    perf_headers = [
+        "team",
+        "Days",
+        "TotalReturn",
+        "AnnReturn",
+        "AnnVol",
+        "Sharpe",
+        "MDD",
+        "FinalNAV",
+        "Skew",
+        "VaR",
+        "ES",
+        "Turnover",
+    ]
     performance_rows_rounded = []
     for row in performance_rows:
         rounded = row.copy()
-        for key in ["TotalReturn", "AnnReturn", "AnnVol", "Sharpe", "MDD", "FinalNAV"]:
+        for key in ["TotalReturn", "AnnReturn", "AnnVol", "Sharpe", "MDD", "FinalNAV", "Skew", "VaR", "ES", "Turnover"]:
             if key in rounded and rounded[key] is not None:
                 rounded[key] = round(rounded[key], 3)
         performance_rows_rounded.append(rounded)
