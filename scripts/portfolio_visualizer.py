@@ -23,7 +23,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Tuple
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 
 # --- constants ---
@@ -293,23 +293,12 @@ def load_price_table(price_csv: Path, required_tickers: Iterable[str]) -> PriceT
     return PriceTable(dates=date_list, tickers=tickers, prices=prices)
 
 
-def compute_nav_paths(
-    price_table: PriceTable,
-    weeks: Mapping[int, Mapping[str, Mapping[str, float]]],
-    schedule: Mapping[int, Tuple[date, date]],
-    starting_capital: float,
-) -> Dict[str, List[Tuple[date, float]]]:
-    teams = sorted({team for week_allocs in weeks.values() for team in week_allocs})
-    nav_series: Dict[str, List[Tuple[date, float]]] = {team: [] for team in teams}
-    nav_state: Dict[str, float] = {team: starting_capital for team in teams}
-
+def build_week_price_indices(
+    price_table: PriceTable, schedule: Mapping[int, Tuple[date, date]]
+) -> Dict[int, List[int]]:
     date_to_index = {dt: idx for idx, dt in enumerate(price_table.dates)}
-
-    for week_num in sorted(schedule):
-        if week_num not in weeks:
-            raise ValueError(f"No weights provided for week {week_num}.")
-
-        start, end = schedule[week_num]
+    week_indices: Dict[int, List[int]] = {}
+    for week_num, (start, end) in sorted(schedule.items()):
         idxs = [
             date_to_index[dt]
             for dt in price_table.dates
@@ -319,13 +308,33 @@ def compute_nav_paths(
             raise ValueError(
                 f"No price data covering {start} to {end} for week {week_num}."
             )
+        week_indices[week_num] = idxs
+    return week_indices
+
+
+def compute_nav_paths(
+    price_table: PriceTable,
+    weeks: Mapping[int, Mapping[str, Mapping[str, float]]],
+    schedule: Mapping[int, Tuple[date, date]],
+    starting_capital: float,
+    week_indices: Mapping[int, List[int]],
+) -> Dict[str, List[Tuple[date, float]]]:
+    teams = sorted({team for week_allocs in weeks.values() for team in week_allocs})
+    nav_series: Dict[str, List[Tuple[date, float]]] = {team: [] for team in teams}
+    nav_state: Dict[str, float] = {team: starting_capital for team in teams}
+
+    for week_num in sorted(schedule):
+        if week_num not in weeks:
+            raise ValueError(f"No weights provided for week {week_num}.")
+        if week_num not in week_indices:
+            raise ValueError(f"No price indices recorded for week {week_num}.")
+        indices = week_indices[week_num]
 
         week_allocs = weeks[week_num]
 
         for team in teams:
             weights = dict(week_allocs.get(team, {}))
             weights.pop(CASH_LABEL, None)
-            indices = idxs
             for pos, idx in enumerate(indices):
                 current_date = price_table.dates[idx]
                 if pos == 0:
@@ -338,7 +347,9 @@ def compute_nav_paths(
                         price_today = price_table.prices[ticker][idx]
                         price_prev = price_table.prices[ticker][prev_idx]
                         if price_prev == 0:
-                            raise ValueError(f"Zero price for {ticker} on {price_table.dates[prev_idx]}")
+                            raise ValueError(
+                                f"Zero price for {ticker} on {price_table.dates[prev_idx]}"
+                            )
                         portfolio_return += w * (price_today / price_prev - 1.0)
                     nav_state[team] *= (1.0 + portfolio_return)
                 nav_series[team].append((current_date, nav_state[team]))
@@ -375,26 +386,79 @@ def _skewness(returns: List[float]) -> float:
     return math.sqrt(n * (n - 1)) / (n - 2) * (m3 / (m2 ** 1.5))
 
 
-def compute_turnover(weeks: Mapping[int, Mapping[str, Mapping[str, float]]]) -> Dict[str, float]:
+def compute_week_growth(
+    price_table: PriceTable, indices: Sequence[int], tickers: Iterable[str]
+) -> Dict[str, float]:
+    start_idx = indices[0]
+    end_idx = indices[-1]
+    if start_idx == end_idx:
+        return {ticker: 1.0 for ticker in tickers}
+    growth: Dict[str, float] = {}
+    for ticker in tickers:
+        series = price_table.prices[ticker]
+        start_price = series[start_idx]
+        end_price = series[end_idx]
+        if start_price == 0:
+            raise ValueError(f"Zero price for {ticker} on {price_table.dates[start_idx]}")
+        growth[ticker] = end_price / start_price
+    return growth
+
+
+def compute_turnover(
+    weeks: Mapping[int, Mapping[str, Mapping[str, float]]],
+    price_table: PriceTable,
+    week_indices: Mapping[int, List[int]],
+    tickers: Iterable[str],
+) -> Dict[str, float]:
     teams = sorted({team for week_allocs in weeks.values() for team in week_allocs})
-    previous: Dict[str, Dict[str, float] | None] = {team: None for team in teams}
     totals: Dict[str, float] = {team: 0.0 for team in teams}
     counts: Dict[str, int] = {team: 0 for team in teams}
+    ticker_set = sorted({ticker for ticker in tickers if ticker != CASH_LABEL})
+    prev_allocs: Dict[str, Dict[str, float]] | None = None
+    prev_week: int | None = None
+    growth_cache: Dict[int, Dict[str, float]] = {}
 
-    for week in sorted(weeks):
+    for week in sorted(week_indices):
+        if week not in weeks:
+            continue
         week_allocs = weeks[week]
+        cleaned: Dict[str, Dict[str, float]] = {}
         for team in teams:
             weights = dict(week_allocs.get(team, {}))
             weights.pop(CASH_LABEL, None)
-            prior = previous[team]
-            if prior is None:
-                previous[team] = weights
-                continue
-            tickers = set(prior) | set(weights)
-            turnover = 0.5 * sum(abs(weights.get(t, 0.0) - prior.get(t, 0.0)) for t in tickers)
-            totals[team] += turnover
-            counts[team] += 1
-            previous[team] = weights
+            cleaned[team] = weights
+
+        if prev_allocs is not None and prev_week is not None:
+            if prev_week not in week_indices:
+                raise ValueError(f"Missing price indices for week {prev_week} during turnover computation.")
+            if prev_week not in growth_cache:
+                growth_cache[prev_week] = compute_week_growth(
+                    price_table, week_indices[prev_week], ticker_set
+                )
+            growth = growth_cache[prev_week]
+            for team in teams:
+                prev_weights = prev_allocs.get(team, {})
+                curr_weights = cleaned.get(team, {})
+                drifted: Dict[str, float] = {}
+                if prev_weights:
+                    grown_values = {
+                        ticker: prev_weights.get(ticker, 0.0) * growth.get(ticker, 1.0)
+                        for ticker in prev_weights
+                    }
+                    total = sum(grown_values.values())
+                    if total > 0:
+                        drifted = {ticker: value / total for ticker, value in grown_values.items()}
+                tickers_union = set(drifted) | set(curr_weights)
+                if not tickers_union:
+                    continue
+                turnover = 0.5 * sum(
+                    abs(curr_weights.get(t, 0.0) - drifted.get(t, 0.0)) for t in tickers_union
+                )
+                totals[team] += turnover
+                counts[team] += 1
+
+        prev_allocs = cleaned
+        prev_week = week
 
     return {team: (totals[team] / counts[team] if counts[team] else 0.0) for team in teams}
 
@@ -630,8 +694,9 @@ def main() -> None:
     if not schedule:
         raise ValueError("Price history does not cover the earliest scheduled week.")
 
-    nav_series = compute_nav_paths(price_table, weeks, schedule, args.capital)
-    turnover_map = compute_turnover(weeks)
+    week_indices = build_week_price_indices(price_table, schedule)
+    nav_series = compute_nav_paths(price_table, weeks, schedule, args.capital, week_indices)
+    turnover_map = compute_turnover(weeks, price_table, week_indices, tickers)
     performance_rows = compute_performance(nav_series, turnover_map)
     weekly_rows = summarize_weekly(nav_series, schedule)
 
