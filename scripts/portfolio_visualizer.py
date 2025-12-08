@@ -335,15 +335,14 @@ def compute_nav_paths(
         for team in teams:
             weights = dict(week_allocs.get(team, {}))
             weights.pop(CASH_LABEL, None)
-            for idx in indices:
+            for pos, idx in enumerate(indices):
                 current_date = price_table.dates[idx]
-                prev_idx = idx - 1
-                if prev_idx < 0:
-                    # Not enough history to compute a return; carry NAV forward.
+                if pos == 0:
                     nav_series[team].append((current_date, nav_state[team]))
                     continue
                 if weights:
                     portfolio_return = 0.0
+                    prev_idx = idx - 1
                     for ticker, w in weights.items():
                         price_today = price_table.prices[ticker][idx]
                         price_prev = price_table.prices[ticker][prev_idx]
