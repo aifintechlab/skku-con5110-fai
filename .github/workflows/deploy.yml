@@ -32,7 +32,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Build site
-        run: python scripts/build_site.py
+        run: python scripts/build_site.py --skip-download --existing-prices data/prices.csv
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
